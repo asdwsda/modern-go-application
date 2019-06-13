@@ -1,0 +1,316 @@
+def node_label = "spotguide-${UUID.randomUUID().toString()}"
+
+pipeline {
+  agent {
+    kubernetes {
+      label node_label
+      defaultContainer 'jnlp'
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins_node: jenkins_node
+spec:
+  containers:
+  - name: allinone
+    image: jenkins_test:local
+    command:
+      - cat
+    tty: true
+  - name: dind
+    image: docker:dind
+    privileged: true
+"""
+/*
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins_node: jenkins_node
+spec:
+  containers:
+  - name: golang
+    image: golang:latest
+    command:
+      - cat
+    tty: true
+  - name: helm
+    image: lachlanevenson/k8s-helm:latest
+    command:
+      - cat
+    tty: true
+  - name: kubectl
+    image: lachlanevenson/k8s-kubectl:latest
+    command:
+      - cat
+    tty: true
+  - name: dind
+    image: docker:dind
+    privileged: true
+"""
+*/
+    }
+  }
+  stages {
+    stage('Prepare environment') {
+      steps {
+        container('allinone') {
+          git 'https://github.com/asdwsda/modern-go-application.git'
+          sh '''
+              curl -L https://github.com/banzaicloud/banzai-cli/releases/download/0.0.16/banzai_0.0.16_linux_amd64.tar.gz \
+                  | tar zx banzai
+              chmod +x banzai
+          '''
+        }
+      }
+    }
+    stage('Ensure cluster') {
+      steps {
+        container('golang') {
+          withCredentials([file(credentialsId: 'BANZAI_CLI_CONFIG', variable: 'BANZAI_CLI_CONFIG')]) {
+            configFileProvider([configFile(fileId: 'banzai-cluster-config', targetLocation: 'banzai-cluster-config.json')]) {
+                sh '''
+                    if ! ./banzai --config ${BANZAI_CLI_CONFIG} cluster get "modern-go-application-spotguide"; then
+                        ./banzai --config ${BANZAI_CLI_CONFIG} cluster create -f banzai-cluster-config.json --no-interactive
+                    fi
+                '''
+            }
+            waitUntil {
+              script {
+                try {
+                    sh '''
+                        ./banzai --config ${BANZAI_CLI_CONFIG} cluster get "modern-go-application-spotguide"  | grep -q "Cluster is running"
+                    '''
+                    return true
+                } catch (exception) {
+                    sleep 60
+                    return false
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Make check'){
+      steps {
+        container('golang') {
+          sh '''
+              export GOFLAGS='-mod=readonly'
+              make check
+          '''
+        }
+      }
+    }
+    stage('Docker') {
+      steps {
+        container('dind') {
+          sh 'docker build .'
+        }
+      }
+    }
+    stage('Helm package') {
+      steps {
+        container('helm') {
+          sh 'helm init -c'
+          sh 'helm repo add banzaicloud-stable http://kubernetes-charts.banzaicloud.com/branch/master'
+          sh 'helm package ./.banzaicloud/charts/spotguide-modern-go-application'
+        }
+      }
+    }
+    stage() {
+      steps {
+        container() {
+          withCredentials([file(credentialsId: 'BANZAI_CLI_CONFIG', variable: 'BANZAI_CLI_CONFIG')]) {
+              sh '''
+cat << EOF | ./banzai --config ${BANZAI_CLI_CONFIG} cluster shell --cluster-name modern-go-application-spotguide -- kubectl apply -n default -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: modern-go-application-mysql-user
+type: Opaque
+data:
+  mysql-username: testuser
+  password: testpassword
+EOF
+                    '''
+                    sh '''
+cat << EOF | ./banzai --config ${BANZAI_CLI_CONFIG} cluster shell --cluster-name modern-go-application-spotguide -- kubectl apply -n default -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: modern-go-application-mysql-root-password
+type: Opaque
+data:
+  mysql-root-password: testrootpassword
+EOF
+'''
+          }
+        }
+      }
+    }
+  }
+}
+
+
+---
+
+def label = "spotguide-${UUID.randomUUID().toString()}"
+
+// Parameters for the build
+properties([
+  parameters([
+     booleanParam(name: 'INSTALL_MYSQL', defaultValue: true, description: 'Install mysql server'),
+  ])
+])
+
+podTemplate(label: label, containers: [
+    containerTemplate(
+        name: 'spotguide',
+        image: 'jenkins_test:local',
+        ttyEnabled: true,
+        command: 'cat',
+        envVars: [
+            envVar(key: 'DOCKER_HOST', value: 'tcp://127.0.0.1:2375/'),
+            envVar(key: 'HELM_HOME', value: '/home/jenkins/workspace/modern-go-application/.helm'),
+            envVar(key: 'CGO_ENABLED', value: 'false'),
+            envVar(key: 'GOFLAGS', value: '-mod=readonly'),
+        ]),
+    containerTemplate(
+        name: 'dind',
+        image: 'docker:dind',
+        privileged: true),
+  ]) {
+    node(label) {
+        container('spotguide'){
+            stage('Git clone') {
+                git 'https://github.com/asdwsda/modern-go-application.git'
+            }
+            stage('Get banzai cli') {
+                /*
+                sh '''
+                    curl -L https://github.com/banzaicloud/banzai-cli/releases/download/0.0.16/banzai_0.0.16_linux_amd64.tar.gz \
+                        | tar zx banzai
+                    chmod +x banzai
+                '''
+                */
+                /*
+                sh '''
+                    mkdir -p `pwd`/.go
+                    GOPATH=`pwd`/.go go get github.com/banzaicloud/banzai-cli/cmd/banzai
+                '''
+                */
+                sh '''
+                    git clone \
+                        --single-branch \
+                        --branch enhance-cluster-cmd \
+                        https://github.com/banzaicloud/banzai-cli.git
+                    cd banzai-cli
+                    make build
+                '''
+            }
+            stage('Ensure cluster') {
+                withCredentials([file(credentialsId: 'BANZAI_CLI_CONFIG', variable: 'BANZAI_CLI_CONFIG')]) {
+                    configFileProvider([configFile(fileId: 'banzai-cluster-config', targetLocation: 'banzai-cluster-config.json')]) {
+                        sh '''
+                            if ! banzai-cli/build/banzai --config ${BANZAI_CLI_CONFIG} cluster get "modern-go-application"; then
+                                banzai-cli/build/banzai \
+                                    --config ${BANZAI_CLI_CONFIG} cluster create -f banzai-cluster-config.json --no-interactive --wait
+                            fi
+                        '''
+                    }
+                }
+            }
+            stage('Make check') {
+                sh '''
+                    export BINARY=golangci-lint
+                    make check
+                '''
+            }
+            stage('Docker build') {
+                sh 'docker build -t modern-go-application:local .'
+                //sh 'docker push modern-go-application:<commit_hash>'
+            }
+            stage('Helm package') {
+                sh 'mkdir -p .helm/repository/cache'
+                sh 'helm init -c'
+                sh 'helm repo add banzaicloud-stable http://kubernetes-charts.banzaicloud.com/branch/master'
+                sh 'helm package ./.banzaicloud/charts/spotguide-modern-go-application'
+            }
+            stage('Create secrets') {
+                withCredentials([file(credentialsId: 'BANZAI_CLI_CONFIG', variable: 'BANZAI_CLI_CONFIG')]) {
+                    sh '''
+cat << EOF | banzai-cli/build/banzai --config ${BANZAI_CLI_CONFIG} cluster shell --cluster-name modern-go-application -- kubectl apply -n default -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: modern-go-application-mysql-user
+type: Opaque
+data:
+  mysql-username: testuser
+  password: testpassword
+EOF
+                    '''
+                    sh '''
+cat << EOF
+    | banzai-cli/build/banzai --config ${BANZAI_CLI_CONFIG} cluster shell --cluster-name modern-go-application -- \
+        kubectl apply -n default -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: modern-go-application-mysql-root-password
+type: Opaque
+data:
+  mysql-root-password: testrootpassword
+EOF
+                    '''
+                }
+            }
+            stage('Deploy application') {
+                withCredentials([file(credentialsId: 'BANZAI_CLI_CONFIG', variable: 'BANZAI_CLI_CONFIG')]) {
+                    sh '''
+cat <<EOF
+nameOverride: 'modern-go-application'
+        application:
+          image:
+            repository: 'modern-go-application'
+            tag: 'local'
+            pullPolicy: Always
+          config:
+            instrumentation:
+              prometheus:
+                enabled: true
+          service:
+            type: LoadBalancer
+EOF > spotguide-values.yaml
+
+if [[ "${INSTALL_MYSQL}" ~= "[Tt]rue" ]]; then
+cat << EOF
+
+        mysql:
+          existingSecret: 'modern-go-application-mysql-root-password'
+          existingUserSecret: 'modern-go-application-mysql-user'
+          metrics:
+            enabled: true
+EOF >> spotguide-values.yaml
+fi
+                    '''
+                    sh '''
+                    banzai-cli/build/banzai cluster shell \
+                        --config ${BANZAI_CLI_CONFIG} \
+                        --cluster-name modern-go-application \
+                        -- \
+                        helm upgrade \
+                            --install \
+                            --reuse-values \
+                            --values spotguide-values.yaml \
+                            modern-go-application \
+                            ./spotguide-modern-go-application-0.2.0.tgz
+                    '''
+                }
+            }
+        }
+    }
+}
