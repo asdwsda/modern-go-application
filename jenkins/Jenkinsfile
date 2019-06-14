@@ -83,7 +83,12 @@ podTemplate(label: label, containers: [
             stage('Create secrets') {
                 withCredentials([file(credentialsId: 'BANZAI_CLI_CONFIG', variable: 'BANZAI_CLI_CONFIG')]) {
                     sh '''
-cat << EOF | banzai-cli/build/banzai --config ${BANZAI_CLI_CONFIG} cluster shell --cluster-name modern-go-application -- kubectl apply -n default -f -
+                    banzai-cli/build/banzai --config ${BANZAI_CLI_CONFIG} cluster shell --cluster-name modern-go-application -- \
+                        kubectl create namespace test
+                    '''
+                    sh '''
+cat << EOF | banzai-cli/build/banzai --config ${BANZAI_CLI_CONFIG} cluster shell --cluster-name modern-go-application -- \
+    kubectl apply -n test -f -
 apiVersion: v1
 kind: Secret
 metadata:
@@ -91,13 +96,12 @@ metadata:
 type: Opaque
 data:
   mysql-username: testuser
-  password: testpassword
+  mysql-password: testpassword
 EOF
                     '''
                     sh '''
-cat << EOF
-    | banzai-cli/build/banzai --config ${BANZAI_CLI_CONFIG} cluster shell --cluster-name modern-go-application -- \
-        kubectl apply -n default -f -
+cat << EOF | banzai-cli/build/banzai --config ${BANZAI_CLI_CONFIG} cluster shell --cluster-name modern-go-application -- \
+    kubectl apply -n test -f -
 apiVersion: v1
 kind: Secret
 metadata:
@@ -116,8 +120,8 @@ cat << EOF > spotguide-values.yaml
 nameOverride: 'modern-go-application'
 application:
   image:
-    repository: 'modern-go-application'
-    tag: 'local'
+    repository: 'sagikazarmark/modern-go-application'  # HACK
+    tag: 'latest'
     pullPolicy: Always
   config:
     instrumentation:
@@ -130,6 +134,8 @@ EOF
 if [[ "${INSTALL_MYSQL}" == "true" ]]; then
 cat << EOF >> spotguide-values.yaml
 mysql:
+  enabled: true
+  database: mgapp
   existingSecret: 'modern-go-application-mysql-root-password'
   existingUserSecret: 'modern-go-application-mysql-user'
   metrics:
@@ -138,16 +144,14 @@ EOF
 fi
                     '''
                     sh '''
-                    helm init --upgrade
                     banzai-cli/build/banzai cluster shell \
                         --config ${BANZAI_CLI_CONFIG} \
                         --cluster-name modern-go-application \
                         -- \
-                        helm init --upgrade
-                    sleep 5
+                        helm init --upgrade --wait
+                    sleep 10
                     '''
                     sh '''
-                    helm init --upgrade
                     banzai-cli/build/banzai cluster shell \
                         --config ${BANZAI_CLI_CONFIG} \
                         --cluster-name modern-go-application \
@@ -156,6 +160,8 @@ fi
                             --install \
                             --reuse-values \
                             --values spotguide-values.yaml \
+                            --namespace test \
+                            --wait \
                             modern-go-application \
                             ${WORKSPACE}/spotguide-modern-go-application-0.2.0.tgz
                     '''
